@@ -382,7 +382,7 @@ function signature(method,url,body,ts) {
   const u=new URL(url); const q=sortedQuery(url); const canonicalUrl=q?`${u.pathname}?${q}`:u.pathname;
   const raw=body==null?'':String(body); const truncated=Buffer.from(raw).subarray(0,102400);
   const bodyHash=body==null?'':md5Hex(truncated); const bodyLen=body==null?'':String(Buffer.byteLength(raw));
-  const canonical=[method.toUpperCase(),'application/json','application/json',bodyLen,String(ts),bodyHash,canonicalUrl].join('\\n');
+  const canonical=[method.toUpperCase(),'application/json','application/json',bodyLen,String(ts),bodyHash,canonicalUrl].join('\n');
   const sig=require('crypto').createHmac('md5',MOVIEBOX_SECRET).update(canonical).digest();
   return `${ts}|2|${b64(sig)}`;
 }
@@ -707,7 +707,7 @@ body{font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;backgrou
 <div class="container">
 <div class="header">
 <h1>🎬 MovieCore <span>Admin v9.0</span></h1>
-<div class="status" id="liveStatus">LIVE</div>
+<div><div><div class="status" id="liveStatus">LIVE</div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div>
 </div>
 
 <div class="panel">
@@ -752,8 +752,8 @@ function esc(v){return String(v??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt
 async function loadStatus(){
 try{
 const d=await get('/admin/api/status');
-if(!d.success)return;
-const t=d.tmdb||{};
+if(!d.success){document.getElementById('liveStatus').textContent='API ERROR';return;}
+const t=d.tmdb||{}; document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time); document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time);
 document.getElementById('tmdbCount').textContent=(t.catalog_total||0).toLocaleString()+' in catalog';
 document.getElementById('tmdbStats').innerHTML=
 '<div class="card blue"><div class="label">Catalog Total</div><div class="value">'+(t.catalog_total||0)+'</div></div>'+
@@ -783,7 +783,7 @@ document.getElementById('healthStats').innerHTML=
 '<div class="card"><div class="label">Heap MB</div><div class="value">'+Math.round((m.heapUsed||0)/1024/1024)+'</div></div>'+
 '<div class="card blue"><div class="label">Workers</div><div class="value">'+(h.worker_limit||0)+'</div></div>'+
 '<div class="card"><div class="label">Uptime</div><div class="value">'+Math.round((h.uptime||0)/60)+'m</div></div>';
-}catch(e){}
+}catch(e){document.getElementById('liveStatus').textContent='API ERROR'; document.getElementById('lastUpdate').textContent=String(e.message||e);}
 }
 
 function formatIST(ts){try{return new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(ts)).replace(',', '')+' IST';}catch{return String(ts);}}
@@ -828,16 +828,26 @@ app.get('/admin', auth, (_req, res) => res.send(adminHtml));
 
 app.get('/admin/api/status', auth, async (_req, res) => {
   try {
-    res.json({ success: true, tmdb: await getStatus().then(x => ({
-      catalog_total: x.catalog_total,
-      movies: x.movies,
-      series: x.series,
-      anime: x.anime,
-      animations: x.animations,
-      episodes: x.episodes,
-      seasons: x.seasons
-    })), scraping: (await getStatus()).scraping, pending: (await getStatus()).pending, health: (await getStatus()).health });
+    const x = await getStatus();
+    res.json({
+      success: true,
+      server_time: new Date().toISOString(),
+      tmdb: {
+        catalog_total: x.catalog_total,
+        movies: x.movies,
+        series: x.series,
+        anime: x.anime,
+        animations: x.animations,
+        episodes: x.episodes,
+        seasons: x.seasons
+      },
+      scraping: x.scraping,
+      pending: x.pending,
+      links: x.links,
+      health: x.health
+    });
   } catch (e) {
+    console.error('[ADMIN STATUS]', e);
     res.status(500).json({ success:false, error:e.message });
   }
 });
