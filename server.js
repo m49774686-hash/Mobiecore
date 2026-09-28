@@ -707,7 +707,7 @@ body{font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;backgrou
 <div class="container">
 <div class="header">
 <h1>🎬 MovieCore <span>Admin v9.0</span></h1>
-<div><div><div class="status" id="liveStatus">LIVE</div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div>
+<div><div class="status" id="liveStatus">LIVE</div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div>
 </div>
 
 <div class="panel">
@@ -729,13 +729,11 @@ body{font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;backgrou
 
 <div class="panel">
 <h2>4. TMDB Log Streams <span class="badge" id="tmdbLogCount">—</span></h2>
-<button class="btn btn-dark" onclick="copyLogs('tmdb')">📋 Copy TMDB Logs</button>
 <div class="terminal" id="tmdbLogs"></div>
 </div>
 
 <div class="panel">
 <h2>5. Scraping Log Streams <span class="badge" id="scrapingLogCount">—</span></h2>
-<button class="btn btn-dark" onclick="copyLogs('scraping')">📋 Copy Scraping Logs</button>
 <div class="terminal" id="scrapingLogs"></div>
 </div>
 
@@ -753,7 +751,7 @@ async function loadStatus(){
 try{
 const d=await get('/admin/api/status');
 if(!d.success){document.getElementById('liveStatus').textContent='API ERROR';return;}
-const t=d.tmdb||{}; document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time); document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time);
+const t=d.tmdb||{}; document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time);
 document.getElementById('tmdbCount').textContent=(t.catalog_total||0).toLocaleString()+' in catalog';
 document.getElementById('tmdbStats').innerHTML=
 '<div class="card blue"><div class="label">Catalog Total</div><div class="value">'+(t.catalog_total||0)+'</div></div>'+
@@ -787,8 +785,6 @@ document.getElementById('healthStats').innerHTML=
 }
 
 function formatIST(ts){try{return new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(ts)).replace(',', '')+' IST';}catch{return String(ts);}}
-async function copyLogs(source){try{const d=await get('/admin/api/logs?source='+source);const lines=(d.logs||[]).map(x=>'['+formatIST(x.timestamp)+'] '+String(x.level||'INFO').toUpperCase()+' | '+x.message);await navigator.clipboard.writeText(lines.join('\n'));alert((source==='tmdb'?'TMDB':'Scraping')+' logs copied');}catch(e){alert('Copy failed: '+e.message);}}
-
 async function loadLogs(source){
 try{
 const d=await get('/admin/api/logs?source='+source);
