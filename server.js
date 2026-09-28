@@ -394,7 +394,9 @@ function clientInfo(){
   return {ua,info:JSON.stringify(info)};
 }
 const movieBoxClientInfo=clientInfo();
-function signedHeaders(method,url,body,token){const ts=Date.now();return {'User-Agent':movieBoxClientInfo.ua,Accept:'application/json','Content-Type':'application/json',Connection:'keep-alive','x-client-token':generateClientToken(ts),'x-tr-signature':signature(method,url,body,ts),'x-client-info':movieBoxClientInfo.info,'x-client-status':'0','x-forwarded-for':`103.${Math.floor(Math.random()*200)+1}.${Math.floor(Math.random()*253)+1}.${Math.floor(Math.random()*253)+1}`,...(token?{Authorization:`Bearer ${token}`}:{})};}
+function randomSpoofedIp(){const prefixes=['103.241','49.36','117.195','106.198','122.162','157.32','182.70','103.58','27.60','59.90']; const prefix=prefixes[Math.floor(Math.random()*prefixes.length)]; return `${prefix}.${Math.floor(Math.random()*253)+1}.${Math.floor(Math.random()*253)+1}`;}
+const movieBoxSpoofedIp=randomSpoofedIp();
+function signedHeaders(method,url,body,token){const ts=Date.now();return {'User-Agent':movieBoxClientInfo.ua,Accept:'application/json','Content-Type':'application/json',Connection:'keep-alive','x-client-token':generateClientToken(ts),'x-tr-signature':signature(method,url,body,ts),'x-client-info':movieBoxClientInfo.info,'x-client-status':'0','x-forwarded-for':movieBoxSpoofedIp,...(token?{Authorization:`Bearer ${token}`}:{})};}
 
 async function fetchJson(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS){
   const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),timeout);
@@ -404,11 +406,20 @@ async function fetchJson(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS){
 }
 async function movieBoxRequest(method,path,body=null){
   if(!movieBoxSession){
+    let sessionErrors=[];
     for(let i=0;i<MOVIEBOX_HOSTS.length;i++){
-      const host=MOVIEBOX_HOSTS[(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length]; const url=host+'/wefeed-mobile-bff/user-api/visitor-login';
-      try { const data=await fetchJson(url,{method:'POST',headers:signedHeaders('POST',url,'{}'),body:'{}'}); const token=data?.token; if(token){movieBoxSession=token;movieBoxActiveHost=(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length;break;} } catch(_){}
+      const host=MOVIEBOX_HOSTS[(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length];
+      const url=host+'/wefeed-mobile-bff/user-api/visitor-login';
+      try {
+        const data=await fetchJson(url,{method:'POST',headers:signedHeaders('POST',url,'{}'),body:'{}'});
+        const token=data?.token;
+        if(token){ movieBoxSession=token; movieBoxActiveHost=(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length; break; }
+        sessionErrors.push(`${host}: response did not contain token`);
+      } catch(e){ sessionErrors.push(`${host}: ${String(e?.message||e).slice(0,180)}`); }
     }
-    if(!movieBoxSession) throw new Error('MovieBox visitor session unavailable');
+    if(!movieBoxSession){
+      throw new Error(`MovieBox visitor session unavailable | ${sessionErrors.join(' || ')}`);
+    }
   }
   let lastErr;
   for(let i=0;i<MOVIEBOX_HOSTS.length;i++){
