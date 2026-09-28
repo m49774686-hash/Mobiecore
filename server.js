@@ -1,7 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
-const https = require('https');
+const dns = require('node:dns').promises;
+const https = require('node:https');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -399,69 +400,70 @@ function randomSpoofedIp(){const prefixes=['103.241','49.36','117.195','106.198'
 const movieBoxSpoofedIp=randomSpoofedIp();
 function signedHeaders(method,url,body,token){const ts=Date.now();return {'User-Agent':movieBoxClientInfo.ua,Accept:'application/json','Content-Type':'application/json',Connection:'keep-alive','x-client-token':generateClientToken(ts),'x-tr-signature':signature(method,url,body,ts),'x-client-info':movieBoxClientInfo.info,'x-client-status':'0','x-forwarded-for':movieBoxSpoofedIp,...(token?{Authorization:`Bearer ${token}`}:{})};}
 
-function errorDetail(e){
-  const c=e?.cause;
-  return [
-    e?.name ? `name=${e.name}` : '',
-    e?.message ? `message=${e.message}` : '',
-    c?.code ? `code=${c.code}` : '',
-    c?.syscall ? `syscall=${c.syscall}` : '',
-    c?.hostname ? `hostname=${c.hostname}` : '',
-    c?.message && c.message!==e?.message ? `cause=${c.message}` : ''
-  ].filter(Boolean).join(' | ');
+function compactNetworkError(e){
+  const c=e?.cause||e;
+  const code=c?.code||e?.code||'';
+  const syscall=c?.syscall||e?.syscall||'';
+  const hostname=c?.hostname||e?.hostname||'';
+  const msg=String(c?.message||e?.message||e).replace(/\s+/g,' ').slice(0,240);
+  return [code&&`code=${code}`,syscall&&`syscall=${syscall}`,hostname&&`hostname=${hostname}`,`message=${msg}`].filter(Boolean).join(' | ');
 }
 
-function httpsJsonViaIp(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS, ip){
-  return new Promise((resolve,reject)=>{
-    const u=new URL(url);
+async function dohResolve4(hostname, timeout=NATIVE_HTTP_TIMEOUT_MS){
+  const providers=[
+    {ip:'1.1.1.1',servername:'cloudflare-dns.com',path:'/dns-query?name='+encodeURIComponent(hostname)+'&type=A'},
+    {ip:'8.8.8.8',servername:'dns.google',path:'/resolve?name='+encodeURIComponent(hostname)+'&type=A'}
+  ];
+  for(const p of providers){
+    try{
+      const data=await new Promise((resolve,reject)=>{
+        const req=https.request({protocol:'https:',hostname:p.ip,port:443,path:p.path,method:'GET',servername:p.servername,headers:{Host:p.servername,Accept:'application/dns-json'},timeout,rejectUnauthorized:true},res=>{
+          let body=''; res.setEncoding('utf8'); res.on('data',c=>body+=c); res.on('end',()=>{try{resolve(JSON.parse(body));}catch(e){reject(e);}});
+        });
+        req.on('timeout',()=>req.destroy(new Error('DoH timeout'))); req.on('error',reject); req.end();
+      });
+      const answers=Array.isArray(data?.Answer)?data.Answer.filter(x=>x.type===1&&x.data).map(x=>x.data):[];
+      if(answers.length) return answers;
+    }catch(e){ /* try next resolver */ }
+  }
+  return [];
+}
+
+async function httpsJsonByIp(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS){
+  const u=new URL(url);
+  let addresses;
+  try {
+    addresses=await dns.resolve4(u.hostname);
+  } catch(e) {
+    addresses=await dohResolve4(u.hostname, Math.min(timeout,8000));
+    if(addresses.length) log('scraping','info',`DNS DoH FALLBACK OK | ${u.hostname} | ${addresses.join(',')}`);
+    else throw new Error(`DNS_RESOLVE_FAILED | ${compactNetworkError(e)} | DOH_FAILED`);
+  }
+  if(!addresses?.length) throw new Error('DNS_RESOLVE_FAILED | no IPv4 address');
+  const ip=addresses[0];
+  return await new Promise((resolve,reject)=>{
     const headers={...(options.headers||{}),Host:u.host};
+    delete headers['content-length'];
     const req=https.request({
-      protocol:u.protocol,
-      hostname:ip,
-      port:u.port || 443,
-      path:u.pathname + u.search,
-      method:options.method || 'GET',
-      headers,
-      servername:u.hostname,
-      timeout,
-      rejectUnauthorized:true
+      protocol:'https:', hostname:ip, port:u.port||443, path:u.pathname+u.search,
+      method:options.method||'GET', headers, servername:u.hostname,
+      timeout, rejectUnauthorized:true
     },res=>{
-      let body='';
-      res.setEncoding('utf8');
+      let body=''; res.setEncoding('utf8');
       res.on('data',c=>body+=c);
       res.on('end',()=>{
         let data; try{data=JSON.parse(body);}catch{data={raw:body};}
-        if(res.statusCode<200 || res.statusCode>=300){
-          const err=new Error(`HTTP ${res.statusCode}: ${body.slice(0,300)}`);
-          err.httpStatus=res.statusCode;
-          return reject(err);
+        if(res.statusCode<200||res.statusCode>=300){
+          return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0,300)}`));
         }
         resolve(data?.data ?? data);
       });
     });
-    req.on('timeout',()=>req.destroy(Object.assign(new Error(`TIMEOUT after ${timeout}ms`),{code:'ETIMEDOUT'})));
+    req.on('timeout',()=>req.destroy(new Error(`TIMEOUT after ${timeout}ms`)));
     req.on('error',reject);
     if(options.body) req.write(options.body);
     req.end();
   });
-}
-
-async function resolveIPv4(host){
-  const providers=[
-    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
-    `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`
-  ];
-  const errors=[];
-  for(const u of providers){
-    try{
-      const r=await fetch(u,{headers:{Accept:'application/dns-json'},signal:AbortSignal.timeout(6000)});
-      const j=await r.json();
-      const ips=(j.Answer||[]).filter(x=>x.type===1&&x.data).map(x=>x.data);
-      if(ips.length) return ips;
-      errors.push(`${u}: no A record`);
-    }catch(e){ errors.push(`${u}: ${errorDetail(e)}`); }
-  }
-  throw new Error(`DoH resolution failed for ${host} | ${errors.join(' || ')}`);
 }
 
 async function fetchJson(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS){
@@ -473,23 +475,10 @@ async function fetchJson(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS){
     return data?.data ?? data;
   } catch(e) {
     if(e?.name==='AbortError') throw new Error(`TIMEOUT after ${timeout}ms`);
-    const detail=errorDetail(e);
-    const retryDns=['EAI_AGAIN','ENOTFOUND','EAI_NODATA'].includes(e?.cause?.code);
-    if(retryDns){
-      const u=new URL(url);
-      try{
-        const ips=await resolveIPv4(u.hostname);
-        let last;
-        for(const ip of ips){
-          try { return await httpsJsonViaIp(url,options,timeout,ip); }
-          catch(err){ last=err; }
-        }
-        throw new Error(`DNS fallback connection failed | host=${u.hostname} | ips=${ips.join(',')} | ${errorDetail(last)}`);
-      }catch(fallbackErr){
-        throw new Error(`NATIVE FETCH FAILED | ${detail} | ${fallbackErr.message}`);
-      }
-    }
-    throw new Error(`NATIVE FETCH FAILED | ${detail}`);
+    const direct=await (async()=>{ try { return await httpsJsonByIp(url,options,timeout); } catch(fallbackErr) {
+      throw new Error(`NATIVE_FETCH_FAILED | ${compactNetworkError(e)} | IP_FALLBACK_FAILED | ${compactNetworkError(fallbackErr)}`);
+    }})();
+    return direct;
   } finally { clearTimeout(timer); }
 }
 async function movieBoxRequest(method,path,body=null){
@@ -501,7 +490,7 @@ async function movieBoxRequest(method,path,body=null){
       try {
         const data=await fetchJson(url,{method:'POST',headers:signedHeaders('POST',url,'{}'),body:'{}'});
         const token=data?.token;
-        if(token){ movieBoxSession=token; movieBoxActiveHost=(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length; break; }
+        if(token){ movieBoxSession=token; movieBoxActiveHost=(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length; log('scraping','info',`MOVIEBOX HOST OK | ${host} | visitor session acquired`); break; }
         sessionErrors.push(`${host}: response did not contain token`);
       } catch(e){ sessionErrors.push(`${host}: ${String(e?.message||e).slice(0,180)}`); }
     }
@@ -740,11 +729,13 @@ body{font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;backgrou
 
 <div class="panel">
 <h2>4. TMDB Log Streams <span class="badge" id="tmdbLogCount">—</span></h2>
+<button class="btn btn-dark" onclick="copyLogs('tmdb')">📋 Copy TMDB Logs</button>
 <div class="terminal" id="tmdbLogs"></div>
 </div>
 
 <div class="panel">
 <h2>5. Scraping Log Streams <span class="badge" id="scrapingLogCount">—</span></h2>
+<button class="btn btn-dark" onclick="copyLogs('scraping')">📋 Copy Scraping Logs</button>
 <div class="terminal" id="scrapingLogs"></div>
 </div>
 
@@ -795,13 +786,16 @@ document.getElementById('healthStats').innerHTML=
 }catch(e){}
 }
 
+function formatIST(ts){try{return new Intl.DateTimeFormat('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(ts)).replace(',', '')+' IST';}catch{return String(ts);}}
+async function copyLogs(source){try{const d=await get('/admin/api/logs?source='+source);const lines=(d.logs||[]).map(x=>'['+formatIST(x.timestamp)+'] '+String(x.level||'INFO').toUpperCase()+' | '+x.message);await navigator.clipboard.writeText(lines.join('\n'));alert((source==='tmdb'?'TMDB':'Scraping')+' logs copied');}catch(e){alert('Copy failed: '+e.message);}}
+
 async function loadLogs(source){
 try{
 const d=await get('/admin/api/logs?source='+source);
 const el=document.getElementById(source==='tmdb'?'tmdbLogs':'scrapingLogs');
 const logs=d.logs||[];
 document.getElementById(source==='tmdb'?'tmdbLogCount':'scrapingLogCount').textContent=logs.length+' entries';
-el.innerHTML=logs.map(x=>'<div class="line '+esc(x.level)+'"><span style="color:#555">'+esc(String(x.timestamp).slice(11,19))+'</span> '+esc(x.message)+'</div>').join('')||'<div class="line info">No logs</div>';
+el.innerHTML=logs.map(x=>'<div class="line '+esc(x.level)+'"><span style="color:#555">'+esc(formatIST(x.timestamp))+'</span> '+esc(x.message)+'</div>').join('')||'<div class="line info">No logs</div>';
 el.scrollTop=el.scrollHeight;
 }catch(e){}
 }
