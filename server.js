@@ -10,14 +10,24 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 const TMDB_LANGUAGE = process.env.TMDB_LANGUAGE || 'en-US';
 const TMDB_MAX_PAGES = Math.max(1, Number(process.env.TMDB_MAX_PAGES || 10));
-const SCRAPER_URL = (process.env.SCRAPER_URL || '').replace(/\/+$/, '');
-const SCRAPER_TIMEOUT_MS = Math.max(5000, Number(process.env.SCRAPER_TIMEOUT_MS || 60000));
+const NATIVE_HTTP_TIMEOUT_MS = Math.max(8000, Number(process.env.NATIVE_HTTP_TIMEOUT_MS || 20000));
+const MOVIEBOX_HOSTS = [
+  'https://api6.aoneroom.com',
+  'https://api5.aoneroom.com',
+  'https://api4.aoneroom.com',
+  'https://api4sg.aoneroom.com',
+  'https://api3.aoneroom.com',
+  'https://api6sg.aoneroom.com',
+  'https://api.inmoviebox.com'
+];
+const MOVIEZONE_GATEWAY_BASE = 'https://moviezone-backend-1.onrender.com';
+const MOVIEBOX_SECRET = Buffer.from([0xef,0xa8,0x91,0x97,0x4e,0xec,0xd3,0x14,0x8d,0xf6,0x3a,0xa6,0x11,0x60,0x2d,0xef,0xd1,0x01,0x25,0x9b,0xa5,0x21,0x02,0x2c,0x57,0xae,0x05,0x66,0xbd,0x8e]);
+const RETRY_STATUS_CODES = new Set([403,406,407,429,500,502,503,504]);
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
 if (!DATABASE_URL) console.warn('[MovieCore] DATABASE_URL is missing');
 if (!TMDB_API_KEY) console.warn('[MovieCore] TMDB_API_KEY is missing');
-if (!SCRAPER_URL) console.warn('[MovieCore] SCRAPER_URL is missing');
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -132,6 +142,23 @@ async function schema() {
 
     CREATE INDEX IF NOT EXISTS idx_moviecore_jobs_ready
       ON moviecore_scrape_jobs(status, next_attempt_at);
+
+    CREATE TABLE IF NOT EXISTS moviecore_links (
+      id BIGSERIAL PRIMARY KEY,
+      catalog_id BIGINT NOT NULL REFERENCES moviecore_catalog(id) ON DELETE CASCADE,
+      media_type TEXT NOT NULL,
+      season_number INTEGER,
+      episode_number INTEGER,
+      provider TEXT,
+      video_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+      subtitle_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+      audio_languages TEXT[] NOT NULL DEFAULT '{}',
+      subtitle_languages TEXT[] NOT NULL DEFAULT '{}',
+      result_json JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(catalog_id, season_number, episode_number)
+    );
   `);
 
   await q(`
@@ -329,74 +356,99 @@ async function tmdbTick() {
 }
 
 /*
-  External scraper adapter.
-  MovieCore never scrapes providers itself. It calls the already-deployed
-  scraper through SCRAPER_URL.
-
-  Supported deployed scraper contract:
-    Movie:
-      GET /extract?tmdb_id=<id>&type=movie
-    TV episode:
-      GET /extract?tmdb_id=<id>&type=tv&season=<n>&episode=<n>
-
-  SCRAPER_PATH can override /extract if the deployed scraper uses another
-  route, but the default is /extract.
+  Native MovieBox integration.
+  No SCRAPER_URL / external scraper ENV is used.
+  The provider/network logic is ported from MovieBox-Tui-Gateway-Ready:
+  - MovieBox visitor session
+  - signed MovieBox requests with x-client-token/x-tr-signature
+  - host failover
+  - subject search/details for gateway-id discovery
+  - MovieZone gateway stream normalization
+  - direct PostgreSQL persistence of playable links/subtitles/languages
 */
-const SCRAPER_PATH = String(process.env.SCRAPER_PATH || '/extract').trim() || '/extract';
+let movieBoxSession = null;
+let movieBoxActiveHost = 0;
 
-async function callExternalScraper(job) {
-  if (!SCRAPER_URL) throw new Error('SCRAPER_URL is not configured');
+function md5Hex(data) { return require('crypto').createHash('md5').update(data).digest('hex'); }
+function b64(buf) { return Buffer.from(buf).toString('base64'); }
+function generateClientToken(ts) { const t=String(ts); return `${t},${md5Hex([...t].reverse().join(''))}`; }
+function sortedQuery(url) {
+  const u=new URL(url); const pairs=[...u.searchParams.entries()].sort((a,b)=>a[0].localeCompare(b[0])||a[1].localeCompare(b[1]));
+  return pairs.map(([k,v])=>`${k}=${v}`).join('&');
+}
+function signature(method,url,body,ts) {
+  const u=new URL(url); const q=sortedQuery(url); const canonicalUrl=q?`${u.pathname}?${q}`:u.pathname;
+  const raw=body==null?'':String(body); const truncated=Buffer.from(raw).subarray(0,102400);
+  const bodyHash=body==null?'':md5Hex(truncated); const bodyLen=body==null?'':String(Buffer.byteLength(raw));
+  const canonical=[method.toUpperCase(),'application/json','application/json',bodyLen,String(ts),bodyHash,canonicalUrl].join('\\n');
+  const sig=require('crypto').createHmac('md5',MOVIEBOX_SECRET).update(canonical).digest();
+  return `${ts}|2|${b64(sig)}`;
+}
+function randomHex(n){let out='';while(out.length<n)out+=Math.floor(Math.random()*16).toString(16);return out.slice(0,n);}
+function clientInfo(){
+  const android=[['9','PQ3A.190605.03081104'],['10','QP1A.191005.007.A3'],['11','RP1A.200720.011'],['12','S1B.220414.015'],['13','TQ2A.230405.003']][Math.floor(Math.random()*5)];
+  const dev=[['23078RKD5C','Redmi'],['2201117TY','Redmi'],['2201117TG','Redmi'],['22101316G','Redmi'],['21121210G','Redmi'],['M2012K11AG','Redmi'],['M2007J20CG','Redmi']][Math.floor(Math.random()*7)];
+  const code=50020117+Math.floor(Math.random()*5); const network=Math.random()<.5?'NETWORK_WIFI':'NETWORK_MOBILE';
+  const ua=`com.community.oneroom/${code} (Linux; U; Android ${android[0]}; en_US; ${dev[0]}; Build/${android[1]}; Cronet/135.0.7012.3)`;
+  const info={package_name:'com.community.oneroom',version_name:'4.0.01.0813.03',version_code:code,os:'android',os_version:android[0],install_ch:'ps',device_id:randomHex(32),install_store:'ps',gaid:`${randomHex(8)}-${randomHex(4)}-${randomHex(4)}-${randomHex(4)}-${randomHex(12)}`,brand:dev[1],model:dev[0],system_language:'en',net:network,region:'US',timezone:'Asia/Kolkata',sp_code:'40401','X-Play-Mode':'2'};
+  return {ua,info:JSON.stringify(info)};
+}
+const movieBoxClientInfo=clientInfo();
+function signedHeaders(method,url,body,token){const ts=Date.now();return {'User-Agent':movieBoxClientInfo.ua,Accept:'application/json','Content-Type':'application/json',Connection:'keep-alive','x-client-token':generateClientToken(ts),'x-tr-signature':signature(method,url,body,ts),'x-client-info':movieBoxClientInfo.info,'x-client-status':'0','x-forwarded-for':`103.${Math.floor(Math.random()*200)+1}.${Math.floor(Math.random()*253)+1}.${Math.floor(Math.random()*253)+1}`,...(token?{Authorization:`Bearer ${token}`}:{})};}
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SCRAPER_TIMEOUT_MS);
-
-  try {
-    const params = new URLSearchParams();
-    params.set('tmdb_id', String(job.tmdb_id));
-
-    if (job.media_type === 'movie') {
-      params.set('type', 'movie');
-    } else {
-      params.set('type', 'tv');
-      params.set('season', String(Number(job.season_number)));
-      params.set('episode', String(Number(job.episode_number)));
+async function fetchJson(url, options={}, timeout=NATIVE_HTTP_TIMEOUT_MS){
+  const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),timeout);
+  try { const r=await fetch(url,{...options,signal:controller.signal}); const text=await r.text(); let data; try{data=JSON.parse(text);}catch{data={raw:text};} if(!r.ok) throw new Error(`HTTP ${r.status}: ${text.slice(0,300)}`); return data?.data ?? data; }
+  catch(e){ if(e?.name==='AbortError') throw new Error(`TIMEOUT after ${timeout}ms`); throw e; }
+  finally{clearTimeout(timer);}
+}
+async function movieBoxRequest(method,path,body=null){
+  if(!movieBoxSession){
+    for(let i=0;i<MOVIEBOX_HOSTS.length;i++){
+      const host=MOVIEBOX_HOSTS[(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length]; const url=host+'/wefeed-mobile-bff/user-api/visitor-login';
+      try { const data=await fetchJson(url,{method:'POST',headers:signedHeaders('POST',url,'{}'),body:'{}'}); const token=data?.token; if(token){movieBoxSession=token;movieBoxActiveHost=(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length;break;} } catch(_){}
     }
-
-    const base = `${SCRAPER_URL}${SCRAPER_PATH.startsWith('/') ? SCRAPER_PATH : `/${SCRAPER_PATH}`}`;
-    const url = `${base}${base.includes('?') ? '&' : '?'}${params.toString()}`;
-
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json, text/plain, */*',
-        'User-Agent': 'MovieCore/1.0'
-      },
-      signal: controller.signal
-    });
-
-    const text = await response.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
-    if (!response.ok) {
-      const compact = text.replace(/\s+/g, ' ').trim().slice(0, 800);
-      throw new Error(`SCRAPER ${response.status} GET ${SCRAPER_PATH}: ${compact}`);
-    }
-
-    // Do not treat a scraper-level failure returned with HTTP 200 as success.
-    if (data && data.success === false) {
-      throw new Error(`SCRAPER returned success=false${data.error ? `: ${String(data.error).slice(0, 600)}` : ''}`);
-    }
-
-    return data;
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      throw new Error(`SCRAPER TIMEOUT after ${SCRAPER_TIMEOUT_MS}ms`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
+    if(!movieBoxSession) throw new Error('MovieBox visitor session unavailable');
   }
+  let lastErr;
+  for(let i=0;i<MOVIEBOX_HOSTS.length;i++){
+    const host=MOVIEBOX_HOSTS[(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length]; const url=host+path; const payload=body==null?null:JSON.stringify(body);
+    try { const data=await fetchJson(url,{method,headers:signedHeaders(method,url,payload,movieBoxSession),...(payload?{body:payload}:{})}); movieBoxActiveHost=(movieBoxActiveHost+i)%MOVIEBOX_HOSTS.length; return data; }
+    catch(e){ lastErr=e; const m=String(e.message||''); if(/HTTP (401|403|429|5\d\d)/.test(m)) continue; }
+  }
+  movieBoxSession=null; throw lastErr||new Error('MovieBox hosts exhausted');
+}
+function walkIds(v){let out={}; const visit=x=>{if(!x||typeof x!=='object')return;if(Array.isArray(x)){for(const z of x)visit(z);return;}for(const k of ['imdb_id','imdbId','imdbID','imdb','tmdb_id','tmdbId','tmdbID','tmdb']){if(x[k]!=null&&String(x[k]).trim()){if(/^imdb/i.test(k)&&!out.imdb)out.imdb=String(x[k]).trim();if(/^tmdb/i.test(k)&&!out.tmdb)out.tmdb=String(x[k]).trim();}}for(const z of Object.values(x))visit(z);};visit(v);return out;}
+async function findMovieBoxSubject(job){
+  const cat=(await q(`SELECT title,original_title,tmdb_json FROM moviecore_catalog WHERE id=$1`,[job.catalog_id])).rows[0];
+  const candidates=[cat?.title,cat?.original_title].filter(Boolean);
+  const target=String(job.tmdb_id);
+  for(const title of candidates){
+    const data=await movieBoxRequest('POST','/wefeed-mobile-bff/subject-api/search/v2',{keyword:title,page:1,perPage:15,subjectType:0});
+    const arr=[]; const walk=x=>{if(!x||typeof x!=='object')return;if(Array.isArray(x)){x.forEach(walk);return;} if(x.subjectId||x.id||x.subject_id||x.tmdbId||x.tmdb_id||x.imdbId||x.imdb_id)arr.push(x); Object.values(x).forEach(walk);}; walk(data);
+    const exact=arr.find(x=>String(x.tmdbId||x.tmdb_id||'')===target||String(x.id||'')===target||String(x.subjectId||x.subject_id||'')===target);
+    const pick=exact||arr.find(x=>String(x.title||x.name||'').toLowerCase().trim()===String(title).toLowerCase().trim());
+    if(pick){const sid=String(pick.subjectId||pick.subject_id||pick.id||'');if(sid)return sid;}
+  }
+  return target;
+}
+async function nativeMovieBoxScrape(job){
+  const subjectId=await findMovieBoxSubject(job);
+  let details={}; try{details=await movieBoxRequest('GET',`/wefeed-mobile-bff/subject-api/get?subjectId=${encodeURIComponent(subjectId)}`);}catch(_){details={};}
+  const ids=walkIds(details); const gatewayId=ids.imdb||ids.tmdb||String(job.tmdb_id);
+  const type=job.media_type==='movie'?'movie':'tv';
+  const url=new URL(`${MOVIEZONE_GATEWAY_BASE}/api/smart/stream/${type}/${encodeURIComponent(gatewayId)}`);
+  if(type==='tv'){url.searchParams.set('season',String(job.season_number));url.searchParams.set('episode',String(job.episode_number));}
+  const payload=await fetchJson(url.toString(),{headers:{Accept:'application/json','User-Agent':'MovieCore-Native/1.0'}},NATIVE_HTTP_TIMEOUT_MS);
+  if(payload?.success===false) throw new Error(payload.message||payload.error||'Gateway returned success=false');
+  const videos=Array.isArray(payload?.video_sources)?payload.video_sources:[];
+  const subtitles=Array.isArray(payload?.subtitle_sources)?payload.subtitle_sources:[];
+  if(!videos.length) throw new Error('No playable video_sources returned');
+  return {success:true,provider:'MovieBox-Tui-native',subject_id:subjectId,gateway_id:gatewayId,video_sources:videos,subtitle_sources:subtitles,audio_languages:payload.audio_languages||[...new Set(videos.map(x=>x.language).filter(Boolean))],subtitle_languages:payload.subtitle_languages||[...new Set(subtitles.map(x=>x.language||x.lanName).filter(Boolean))],raw:payload};
+}
+
+async function persistScrapeResult(job,data){
+  await q(`INSERT INTO moviecore_links(catalog_id,media_type,season_number,episode_number,provider,video_sources,subtitle_sources,audio_languages,subtitle_languages,result_json,updated_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10::jsonb,NOW()) ON CONFLICT(catalog_id,season_number,episode_number) DO UPDATE SET provider=EXCLUDED.provider,video_sources=EXCLUDED.video_sources,subtitle_sources=EXCLUDED.subtitle_sources,audio_languages=EXCLUDED.audio_languages,subtitle_languages=EXCLUDED.subtitle_languages,result_json=EXCLUDED.result_json,updated_at=NOW()`,[job.catalog_id,job.media_type,job.season_number,job.episode_number,data.provider,JSON.stringify(data.video_sources||[]),JSON.stringify(data.subtitle_sources||[]),data.audio_languages||[],data.subtitle_languages||[],JSON.stringify(data)]);
 }
 
 async function scraperTick() {
@@ -427,7 +479,8 @@ async function scraperTick() {
     log('scraping', 'info', `START | ${job.title || job.tmdb_id} | tmdb=${job.tmdb_id}`);
 
     try {
-      const data = await callExternalScraper(job);
+      const data = await nativeMovieBoxScrape(job);
+      await persistScrapeResult(job, data);
 
       await q(`
         UPDATE moviecore_scrape_jobs
@@ -435,7 +488,7 @@ async function scraperTick() {
         WHERE id=$1
       `, [job.id, JSON.stringify(data)]);
 
-      log('scraping', 'info', `SUCCESS | ${job.title || job.tmdb_id}`);
+      log('scraping', 'info', `SUCCESS | ${job.title || job.tmdb_id} | links=${(data.video_sources||[]).length} subtitles=${(data.subtitle_sources||[]).length}`);
     } catch (error) {
       await q(`
         UPDATE moviecore_scrape_jobs
@@ -455,7 +508,8 @@ async function scraperTick() {
 
 async function resetMovieCore() {
   await q(`
-    TRUNCATE moviecore_scrape_jobs,
+    TRUNCATE moviecore_links,
+             moviecore_scrape_jobs,
              moviecore_episodes,
              moviecore_seasons,
              moviecore_catalog,
@@ -499,6 +553,7 @@ async function getStatus() {
 
   const db = r.rows[0];
   const p = pending.rows[0];
+  const links = await q(`SELECT COUNT(*)::int AS count, COALESCE(SUM(jsonb_array_length(video_sources)),0)::int AS videos, COALESCE(SUM(jsonb_array_length(subtitle_sources)),0)::int AS subtitles FROM moviecore_links`);
 
   return {
     catalog_total: db.catalog_total,
@@ -513,6 +568,7 @@ async function getStatus() {
       worker_limit: 2
     },
     pending: p,
+    links: links.rows[0],
     tmdb: tmdbState,
     health: {
       pressure: 'healthy',
@@ -727,6 +783,8 @@ app.get('/api/tv', async (_req,res) => {
   const r=await q(`SELECT * FROM moviecore_catalog WHERE media_type='tv' ORDER BY updated_at DESC LIMIT 100`);
   res.json(r.rows);
 });
+
+app.get('/api/links/:catalogId', async (req,res) => { const r=await q(`SELECT * FROM moviecore_links WHERE catalog_id=$1 ORDER BY COALESCE(season_number,0), COALESCE(episode_number,0)`, [req.params.catalogId]); res.json(r.rows); });
 
 let loopRunning = false;
 async function backgroundLoop(){
