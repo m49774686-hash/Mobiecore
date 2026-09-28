@@ -161,6 +161,30 @@ async function schema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE(catalog_id, season_number, episode_number)
     );
+
+    CREATE TABLE IF NOT EXISTS moviecore_link_items (
+      id BIGSERIAL PRIMARY KEY,
+      catalog_id BIGINT NOT NULL REFERENCES moviecore_catalog(id) ON DELETE CASCADE,
+      media_type TEXT NOT NULL,
+      season_number INTEGER,
+      episode_number INTEGER,
+      provider TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      url TEXT NOT NULL,
+      quality TEXT,
+      language TEXT,
+      label TEXT,
+      referer TEXT,
+      user_agent TEXT,
+      headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+      validated BOOLEAN NOT NULL DEFAULT TRUE,
+      raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(catalog_id, season_number, episode_number, provider, kind, url)
+    );
+    CREATE INDEX IF NOT EXISTS idx_moviecore_link_items_lookup
+      ON moviecore_link_items(catalog_id, season_number, episode_number);
   `);
 
   await q(`
@@ -535,8 +559,47 @@ async function nativeMovieBoxScrape(job){
   return {success:true,provider:'MovieBox-Tui-native',subject_id:subjectId,gateway_id:gatewayId,video_sources:videos,subtitle_sources:subtitles,audio_languages:payload.audio_languages||[...new Set(videos.map(x=>x.language).filter(Boolean))],subtitle_languages:payload.subtitle_languages||[...new Set(subtitles.map(x=>x.language||x.lanName).filter(Boolean))],raw:payload};
 }
 
+function validHttpUrl(value){
+  try { const u=new URL(String(value||'').trim()); return u.protocol==='http:' || u.protocol==='https:'; } catch { return false; }
+}
+
 async function persistScrapeResult(job,data){
-  await q(`INSERT INTO moviecore_links(catalog_id,media_type,season_number,episode_number,provider,video_sources,subtitle_sources,audio_languages,subtitle_languages,result_json,updated_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10::jsonb,NOW()) ON CONFLICT(catalog_id,season_number,episode_number) DO UPDATE SET provider=EXCLUDED.provider,video_sources=EXCLUDED.video_sources,subtitle_sources=EXCLUDED.subtitle_sources,audio_languages=EXCLUDED.audio_languages,subtitle_languages=EXCLUDED.subtitle_languages,result_json=EXCLUDED.result_json,updated_at=NOW()`,[job.catalog_id,job.media_type,job.season_number,job.episode_number,data.provider,JSON.stringify(data.video_sources||[]),JSON.stringify(data.subtitle_sources||[]),data.audio_languages||[],data.subtitle_languages||[],JSON.stringify(data)]);
+  const videos=Array.isArray(data.video_sources)?data.video_sources:[];
+  const subtitles=Array.isArray(data.subtitle_sources)?data.subtitle_sources:[];
+  const provider=String(data.provider||'unknown');
+
+  await q(`INSERT INTO moviecore_links(catalog_id,media_type,season_number,episode_number,provider,video_sources,subtitle_sources,audio_languages,subtitle_languages,result_json,updated_at)
+    VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10::jsonb,NOW())
+    ON CONFLICT(catalog_id,season_number,episode_number) DO UPDATE SET
+      provider=EXCLUDED.provider, video_sources=EXCLUDED.video_sources, subtitle_sources=EXCLUDED.subtitle_sources,
+      audio_languages=EXCLUDED.audio_languages, subtitle_languages=EXCLUDED.subtitle_languages, result_json=EXCLUDED.result_json, updated_at=NOW()`,
+    [job.catalog_id,job.media_type,job.season_number,job.episode_number,provider,JSON.stringify(videos),JSON.stringify(subtitles),data.audio_languages||[],data.subtitle_languages||[],JSON.stringify(data)]);
+
+  // Keep every individual playable/subtitle URL as its own durable DB row.
+  // This is intentionally separate from moviecore_links so future providers
+  // can add links without overwriting links already found from another source.
+  const rows=[];
+  for(const item of videos){
+    const url=item?.url || item?.link || item?.stream || item?.src;
+    if(!validHttpUrl(url)) continue;
+    rows.push({kind:'video',url,quality:item.quality||item.resolution||null,language:item.language||item.lang||null,label:item.label||item.name||null,referer:item.referer||null,user_agent:item.user_agent||null,headers:item.headers||{},raw:item});
+  }
+  for(const item of subtitles){
+    const url=item?.url || item?.link || item?.src;
+    if(!validHttpUrl(url)) continue;
+    rows.push({kind:'subtitle',url,quality:null,language:item.language||item.lang||item.lanName||null,label:item.label||item.name||null,referer:item.referer||null,user_agent:item.user_agent||null,headers:item.headers||{},raw:item});
+  }
+  for(const row of rows){
+    await q(`INSERT INTO moviecore_link_items
+      (catalog_id,media_type,season_number,episode_number,provider,kind,url,quality,language,label,referer,user_agent,headers,validated,raw_json,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,TRUE,$14::jsonb,NOW())
+      ON CONFLICT(catalog_id,season_number,episode_number,provider,kind,url) DO UPDATE SET
+        quality=EXCLUDED.quality,language=EXCLUDED.language,label=EXCLUDED.label,referer=EXCLUDED.referer,
+        user_agent=EXCLUDED.user_agent,headers=EXCLUDED.headers,validated=TRUE,raw_json=EXCLUDED.raw_json,updated_at=NOW()`,
+      [job.catalog_id,job.media_type,job.season_number,job.episode_number,provider,row.kind,row.url,row.quality,row.language,row.label,row.referer,row.user_agent,JSON.stringify(row.headers||{}),JSON.stringify(row.raw||{})]);
+  }
+
+  return rows.length;
 }
 
 async function scraperTick() {
@@ -568,7 +631,7 @@ async function scraperTick() {
 
     try {
       const data = await nativeMovieBoxScrape(job);
-      await persistScrapeResult(job, data);
+      const savedLinkCount = await persistScrapeResult(job, data);
 
       await q(`
         UPDATE moviecore_scrape_jobs
@@ -576,7 +639,7 @@ async function scraperTick() {
         WHERE id=$1
       `, [job.id, JSON.stringify(data)]);
 
-      log('scraping', 'info', `SUCCESS | ${job.title || job.tmdb_id} | links=${(data.video_sources||[]).length} subtitles=${(data.subtitle_sources||[]).length}`);
+      log('scraping', 'info', `SUCCESS | ${job.title || job.tmdb_id} | videos=${(data.video_sources||[]).length} subtitles=${(data.subtitle_sources||[]).length} DB_LINKS=${savedLinkCount}`);
     } catch (error) {
       await q(`
         UPDATE moviecore_scrape_jobs
@@ -596,7 +659,8 @@ async function scraperTick() {
 
 async function resetMovieCore() {
   await q(`
-    TRUNCATE moviecore_links,
+    TRUNCATE moviecore_link_items,
+             moviecore_links,
              moviecore_scrape_jobs,
              moviecore_episodes,
              moviecore_seasons,
@@ -641,7 +705,7 @@ async function getStatus() {
 
   const db = r.rows[0];
   const p = pending.rows[0];
-  const links = await q(`SELECT COUNT(*)::int AS count, COALESCE(SUM(jsonb_array_length(video_sources)),0)::int AS videos, COALESCE(SUM(jsonb_array_length(subtitle_sources)),0)::int AS subtitles FROM moviecore_links`);
+  const links = await q(`SELECT COUNT(*)::int AS count, COUNT(*) FILTER (WHERE kind='video')::int AS videos, COUNT(*) FILTER (WHERE kind='subtitle')::int AS subtitles FROM moviecore_link_items`);
 
   return {
     catalog_total: db.catalog_total,
@@ -707,7 +771,7 @@ body{font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;backgrou
 <div class="container">
 <div class="header">
 <h1>🎬 MovieCore <span>Admin v9.0</span></h1>
-<div><div class="status" id="liveStatus">LIVE</div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div>
+<div><div><div class="status" id="liveStatus">LIVE</div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div><div id="lastUpdate" style="font-size:10px;color:#666;text-align:right;margin-top:5px"></div></div>
 </div>
 
 <div class="panel">
@@ -751,7 +815,7 @@ async function loadStatus(){
 try{
 const d=await get('/admin/api/status');
 if(!d.success){document.getElementById('liveStatus').textContent='API ERROR';return;}
-const t=d.tmdb||{}; document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time);
+const t=d.tmdb||{}; document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time); document.getElementById('liveStatus').textContent='LIVE'; document.getElementById('lastUpdate').textContent='Updated: '+formatIST(d.server_time);
 document.getElementById('tmdbCount').textContent=(t.catalog_total||0).toLocaleString()+' in catalog';
 document.getElementById('tmdbStats').innerHTML=
 '<div class="card blue"><div class="label">Catalog Total</div><div class="value">'+(t.catalog_total||0)+'</div></div>'+
@@ -883,7 +947,11 @@ app.get('/api/tv', async (_req,res) => {
   res.json(r.rows);
 });
 
-app.get('/api/links/:catalogId', async (req,res) => { const r=await q(`SELECT * FROM moviecore_links WHERE catalog_id=$1 ORDER BY COALESCE(season_number,0), COALESCE(episode_number,0)`, [req.params.catalogId]); res.json(r.rows); });
+app.get('/api/links/:catalogId', async (req,res) => {
+  const grouped=await q(`SELECT * FROM moviecore_links WHERE catalog_id=$1 ORDER BY COALESCE(season_number,0), COALESCE(episode_number,0)`, [req.params.catalogId]);
+  const items=await q(`SELECT id,media_type,season_number,episode_number,provider,kind,url,quality,language,label,referer,user_agent,headers,validated,updated_at FROM moviecore_link_items WHERE catalog_id=$1 ORDER BY COALESCE(season_number,0),COALESCE(episode_number,0),kind,id`, [req.params.catalogId]);
+  res.json({success:true,groups:grouped.rows,items:items.rows,links:items.rows});
+});
 
 let loopRunning = false;
 async function backgroundLoop(){
