@@ -329,11 +329,21 @@ async function tmdbTick() {
 }
 
 /*
-  IMPORTANT:
-  This is ONLY an ENV-based adapter.
-  No browser scraping/provider logic is implemented here.
-  The exact deployed scraper HTTP contract must be supplied/confirmed.
+  External scraper adapter.
+  MovieCore never scrapes providers itself. It calls the already-deployed
+  scraper through SCRAPER_URL.
+
+  Supported deployed scraper contract:
+    Movie:
+      GET /extract?tmdb_id=<id>&type=movie
+    TV episode:
+      GET /extract?tmdb_id=<id>&type=tv&season=<n>&episode=<n>
+
+  SCRAPER_PATH can override /extract if the deployed scraper uses another
+  route, but the default is /extract.
 */
+const SCRAPER_PATH = String(process.env.SCRAPER_PATH || '/extract').trim() || '/extract';
+
 async function callExternalScraper(job) {
   if (!SCRAPER_URL) throw new Error('SCRAPER_URL is not configured');
 
@@ -341,20 +351,26 @@ async function callExternalScraper(job) {
   const timer = setTimeout(() => controller.abort(), SCRAPER_TIMEOUT_MS);
 
   try {
-    const path = job.media_type === 'movie' ? '/movie' : '/tv';
-    const payload = job.media_type === 'movie'
-      ? { tmdb_id: String(job.tmdb_id), type: 'movie' }
-      : {
-          tmdb_id: String(job.tmdb_id),
-          type: 'tv',
-          season: Number(job.season_number),
-          episode: Number(job.episode_number)
-        };
+    const params = new URLSearchParams();
+    params.set('tmdb_id', String(job.tmdb_id));
 
-    const response = await fetch(`${SCRAPER_URL}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(payload),
+    if (job.media_type === 'movie') {
+      params.set('type', 'movie');
+    } else {
+      params.set('type', 'tv');
+      params.set('season', String(Number(job.season_number)));
+      params.set('episode', String(Number(job.episode_number)));
+    }
+
+    const base = `${SCRAPER_URL}${SCRAPER_PATH.startsWith('/') ? SCRAPER_PATH : `/${SCRAPER_PATH}`}`;
+    const url = `${base}${base.includes('?') ? '&' : '?'}${params.toString()}`;
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        'User-Agent': 'MovieCore/1.0'
+      },
       signal: controller.signal
     });
 
@@ -363,10 +379,21 @@ async function callExternalScraper(job) {
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
     if (!response.ok) {
-      throw new Error(`SCRAPER ${response.status}: ${text.slice(0, 500)}`);
+      const compact = text.replace(/\s+/g, ' ').trim().slice(0, 800);
+      throw new Error(`SCRAPER ${response.status} GET ${SCRAPER_PATH}: ${compact}`);
+    }
+
+    // Do not treat a scraper-level failure returned with HTTP 200 as success.
+    if (data && data.success === false) {
+      throw new Error(`SCRAPER returned success=false${data.error ? `: ${String(data.error).slice(0, 600)}` : ''}`);
     }
 
     return data;
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`SCRAPER TIMEOUT after ${SCRAPER_TIMEOUT_MS}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
